@@ -1,5 +1,4 @@
-module.exports = function isIsraeliIdValid(id)
-{
+module.exports = function isIsraeliIdValid(id) {
     let strId = String(id).trim();
     if (strId.length > 9) {
         return false;
