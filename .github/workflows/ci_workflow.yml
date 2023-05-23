@@ -1,0 +1,296 @@
+name: RiseUp CI
+
+on:
+  workflow_dispatch:
+  push:
+    paths-ignore: .github/workflows/**
+
+env:
+  node_version: "18.x"
+
+jobs:
+
+  ContinuousIntegration:
+    runs-on: ubuntu-20.04
+    # run only if it's not a tag, and not a bump-version push (coming from a previous CI job)
+    if: github.ref_type != 'tag' && !contains(github.event.commits[0].message, 'Bumping NPM package version')
+
+    steps:
+
+      - name: Checkout the component repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 5 # Fetch depth 5 for packages that deploy to Chromatic. The performance impact is negligable. 
+          persist-credentials: false
+          ssh-strict: true
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+
+      - name: Check if the service.env file exists
+        id: check_env_file
+        uses: andstor/file-existence-action@v1
+        with:
+          files: "ci/service.env"
+
+      - name: Load env vars from service.env
+        uses: c-py/action-dotenv-to-setenv@v2
+        with:
+          env-file: "ci/service.env"
+        if: steps.check_env_file.outputs.files_exists == 'true'
+
+      - name: Set branch_name env
+        run: echo "branch_name=$(echo ${GITHUB_REF#refs/heads/})" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Get and set commits msg
+        run: echo "commits_msg=$(git log -1 --pretty=format:"%an -  %s, %ai"  $*  | jq --raw-input --slurp '.'|xargs)" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Sending Slack alert for workflow start
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_TITLE: "`${{ env.serviceName }}` CI started on branch `${{ env.branch_name }}`."
+          SLACK_MESSAGE: ${{ env.commits_msg }}
+          SLACK_USERNAME: "github actions"
+          MSG_MINIMAL: true
+          SLACK_COLOR: "#FFFF00"
+
+      - name: Checkout the shared repository
+        uses: actions/checkout@v2
+        with:
+          repository: riseupil/github_actions_shared
+          ref: master
+          path: github_actions_shared
+          persist-credentials: false
+          ssh-strict: true
+          clean: true
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+
+      # the following few steps are only relevant for packages whose tests depend on some docker container 
+      # for example - tests that rely on Mongo or on Rabbit. 
+      # we therefore only execute them if there's a docker-compose file in the root dir of the repo. 
+      # We also configure AWS credentials if it's required in service.env
+      - name: Check if there's a docker-compose file
+        id: check_docker_compose_file
+        uses: andstor/file-existence-action@v1
+        with:
+          files: "docker-compose.yml"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.LOCALENV_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.LOCALENV_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{env.AWS_REGION}}
+          role-to-assume: deployer
+          role-duration-seconds: 1200
+          role-session-name: GitHubAction
+        if: steps.check_docker_compose_file.outputs.files_exists == 'true' || env.requires_aws_credentials == 'true'
+
+      - name: login to ECR
+        run: aws ecr get-login-password --region ${{env.AWS_REGION}} | docker login --username AWS --password-stdin 304238886501.dkr.ecr.eu-west-1.amazonaws.com
+        if: steps.check_docker_compose_file.outputs.files_exists == 'true'
+
+      - name: Start test dependecies
+        run: docker-compose up -d
+        if: steps.check_docker_compose_file.outputs.files_exists == 'true'
+
+      - name: Prepare node
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{env.node_version}}
+          registry-url: https://npm.pkg.github.com/
+          cache: 'npm'
+        env: 
+          NODE_AUTH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+
+      - name: Install dependencies 
+        id: install_package
+        uses: ./github_actions_shared/install_package
+        with:
+          MY_GITHUB_TOKEN: ${{secrets.MY_GITHUB_TOKEN}}
+        env:
+          NODE_AUTH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+
+      - name: compile the package (only if there's a build script)
+        run: |
+          if npm run | egrep "build$" ; then 
+          echo running build 
+          npm run build
+          fi  
+        shell: bash 
+
+      - name: Check if test.sh file exists
+        id: check_test_file
+        uses: andstor/file-existence-action@v1
+        with:
+          files: "ci/test.sh"
+
+      - name: Run test file
+        id: run_test
+        uses: ./github_actions_shared/test
+        with:
+          MY_GITHUB_TOKEN: ${{secrets.MY_GITHUB_TOKEN}}
+          TEST_FILE_NAME: "ci/test.sh"
+        if: steps.check_test_file.outputs.files_exists == 'true'
+
+      - name: Publish to Chromatic
+        uses: chromaui/action@v1
+        with:
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+          projectToken: ${{ secrets.CHROMATIC_PROJECT_TOKEN }}
+        if: env.deploy_to_chromatic == 'true'
+
+      - name: Sending summery message to Slack
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_TITLE: "`${{ env.serviceName }}` - CI result on branch `${{ env.branch_name }}`: ${{job.status}}"
+          SLACK_MESSAGE: "Build finished"
+          SLACK_USERNAME: "github actions"
+          MSG_MINIMAL: true
+          SLACK_COLOR: ${{job.status}}
+
+  BumpUpNpmPackageVersion:
+    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/private-npm-repo')
+
+    needs: ContinuousIntegration
+
+    runs-on: ubuntu-20.04
+    permissions:
+      contents: write
+
+    outputs:
+      git_ref: ${{ steps.get_git_ref.outputs.hash }}
+
+    steps:
+
+      - name: Checkout the component repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+          ssh-strict: true
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+
+      - name: configure git so we can commit a change, remove the credentials from install_package
+        run: |
+          git config --global user.email "cont.integration@riseup.co.il"
+          git config --global user.name "GitHub Actions"
+
+      - name: bump up the version of the package, so we can push it to the repository.
+        run: ${GITHUB_WORKSPACE}/.github/scripts/npm_version-bump.sh
+        shell: bash
+
+      - name: push the change of the version number
+        run: git push --tags --atomic origin HEAD 
+
+      - name: get the hash of the last commit (the one with the new version number)
+        id: get_git_ref
+        run: |
+          HASH=`git log -1 --pretty="format:%H"`
+          echo "hash=${HASH}" >> "$GITHUB_OUTPUT" 
+      
+  PublishRepo:
+
+    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/private-npm-repo')
+
+    needs: BumpUpNpmPackageVersion
+    runs-on: ubuntu-20.04
+    permissions:
+      packages: write
+
+    steps:
+
+      # We first checkout the 'original' version - prior to bumping up the version. 
+      # We do that so we can use the NPM cache in setup-node (performance)
+      - name: Checkout the component repository - the commit prior to bumping up the version 
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ssh-strict: true
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+
+      - name: Check if the service.env file exists
+        id: publish_check_env_file
+        uses: andstor/file-existence-action@v1
+        with:
+          files: "ci/service.env"
+
+      - name: Load env vars from service.env
+        uses: c-py/action-dotenv-to-setenv@v2
+        with:
+          env-file: "ci/service.env"
+        if: steps.publish_check_env_file.outputs.files_exists == 'true'
+
+      - name: Prepare node
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{env.node_version}}
+          registry-url: https://npm.pkg.github.com/
+          cache: 'npm'
+        env:
+          NODE_AUTH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+
+      # Now, checkout the repo again - but with the correct version (ref) - the one *with* the new version. 
+      - name: print the git reference we should be using 
+        run: echo about to package commit ${{needs.BumpUpNpmPackageVersion.outputs.git_ref}}
+
+      - name: Checkout the component repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ssh-strict: true
+          ref: ${{needs.BumpUpNpmPackageVersion.outputs.git_ref}}
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+
+      - name: Check if the service.env file exists
+        id: check_env_file
+        uses: andstor/file-existence-action@v1
+        with:
+          files: "ci/service.env"
+
+      - name: Load env vars from service.env
+        uses: c-py/action-dotenv-to-setenv@v2
+        with:
+          env-file: "ci/service.env"
+        if: steps.check_env_file.outputs.files_exists == 'true'
+
+      - name: Checkout the shared repository
+        uses: actions/checkout@v2
+        with:
+          repository: riseupil/github_actions_shared
+          ref: master
+          path: github_actions_shared
+          persist-credentials: false
+          ssh-strict: true
+          clean: true
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+
+      - name: Install dependencies 
+        id: install_package
+        uses: ./github_actions_shared/install_package
+        with:
+          MY_GITHUB_TOKEN: ${{secrets.MY_GITHUB_TOKEN}}
+        env:
+          NODE_AUTH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+
+      - name: compile the package (only if there's a build script)
+        run: |
+          if npm run | egrep "build$" ; then  
+          echo running build 
+          npm run build
+          fi  
+        shell: bash 
+
+      - name: revert package.json and package-lock.json to their original state
+        run: git checkout HEAD package*.json
+
+      - name: publish the package to GitHub packages
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+          NPM_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}          

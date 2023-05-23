@@ -1,10 +1,13 @@
 {
-  "name": "israeli-id-validator",
+  "name": "@riseupil/israeli-id-validator",
   "version": "1.0.1",
   "description": "Validates Israeli ids (forked from https://github.com/atlanteh/israeli-id-validator/blob/master/index.js)",
   "main": "index.js",
   "scripts": {
     "test": "mocha tests"
+  },
+  "publishConfig": {
+    "@riseupil:registry": "https://npm.pkg.github.com"
   },
   "keywords": [
     "israeli",
